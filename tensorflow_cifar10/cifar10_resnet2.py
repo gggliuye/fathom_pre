@@ -40,10 +40,9 @@ import os
 import re
 import sys
 import tarfile
-
 import tensorflow.python.platform
-from six.moves import urllib
 import tensorflow as tf
+import numpy as np
 
 #from tensorflow.models.image.cifar10 import cifar10_input
 import cifar10_input
@@ -94,47 +93,6 @@ def _activation_summary(x):
   tf.contrib.deprecated.histogram_summary(tensor_name + '/activations', x)
   tf.contrib.deprecated.scalar_summary(tensor_name + '/sparsity', tf.nn.zero_fraction(x))
 
-
-def _variable_on_cpu(name, shape, initializer):
-  """Helper to create a Variable stored on CPU memory.
-
-  Args:
-    name: name of the variable
-    shape: list of ints
-    initializer: initializer for Variable
-
-  Returns:
-    Variable Tensor
-  """
-  with tf.device('/cpu:0'):
-    var = tf.get_variable(name, shape, initializer=initializer)
-  return var
-
-
-def _variable_with_weight_decay(name, shape, stddev, wd):
-  """Helper to create an initialized Variable with weight decay.
-
-  Note that the Variable is initialized with a truncated normal distribution.
-  A weight decay is added only if one is specified.
-
-  Args:
-    name: name of the variable
-    shape: list of ints
-    stddev: standard deviation of a truncated Gaussian
-    wd: add L2Loss weight decay multiplied by this float. If None, weight
-        decay is not added for this Variable.
-
-  Returns:
-    Variable Tensor
-  """
-  var = _variable_on_cpu(name, shape,
-                         tf.truncated_normal_initializer(stddev=stddev))
-  if wd:
-    weight_decay = tf.multiply(tf.nn.l2_loss(var), wd, name='weight_loss')
-    tf.add_to_collection('losses', weight_decay)
-  return var
-
-
 def distorted_inputs():
   """Construct distorted input for CIFAR training using the Reader ops.
 
@@ -171,91 +129,231 @@ def inputs(eval_data):
   return cifar10_input.inputs(eval_data=eval_data, data_dir=data_dir,
                               batch_size=FLAGS.batch_size)
 
+
+def conv(name, x, filter_size, in_filters, out_filters, strides):
+    """Convolution."""
+    with tf.variable_scope(name):
+      n = filter_size * filter_size * out_filters
+      kernel = tf.get_variable('DW', [filter_size, filter_size, in_filters, out_filters],
+      tf.float32, initializer=tf.random_normal_initializer(stddev=np.sqrt(2.0/n)))
+      return tf.nn.conv2d(x, kernel, strides, padding='SAME')
+
+
+def fully_connected( x,in_dim, out_dim):
+    """FullyConnected layer for final output."""
+    x = tf.reshape(x, [-1, in_dim])
+    w = tf.get_variable(
+        'DW', [x.get_shape()[1], out_dim],
+        initializer=tf.uniform_unit_scaling_initializer(factor=1.0))
+    b = tf.get_variable('biases', [out_dim],
+                        initializer=tf.constant_initializer())
+    return tf.add(tf.matmul(x, w), b)
+
 def inference(images):
-  """Build the CIFAR-10 model.
+    with tf.variable_scope('init'):
+      x = conv('init_conv', images, 3, 3, 16, [1,1,1,1])
 
-  Args:
-    images: Images returned from distorted_inputs() or inputs().
+      # Uncomment the following codes to use w28-10 wide residual network.
+      # It is more memory efficient than very deep residual network and has
+      # comparably good performance.
+      # https://arxiv.org/pdf/1605.07146v1.pdf
+      # filters = [16, 160, 320, 640]
+      # Update hps.num_residual_units to 4
+    in_filter=16
+    out_filter=16
+    stride=[1,1,1,1]
+    with tf.variable_scope('unit_1_0'):
+      with tf.variable_scope('shared_activation'):
+        #x = batch_norm('init_bn', x)
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm1')
 
-  Returns:
-    Logits.
-  """
-  # We instantiate all variables using tf.get_variable() instead of
-  # tf.Variable() in order to share variables across multiple GPU training runs.
-  # If we only ran this model on a single GPU, we could simplify this function
-  # by replacing all instances of tf.get_variable() with tf.Variable().
-  #
-  # conv1
-  with tf.variable_scope('conv1') as scope:
-    kernel = _variable_with_weight_decay('weights', shape=[5, 5, 3, 64],
-                                         stddev=1e-4, wd=0.0)
-    conv = tf.nn.conv2d(images, kernel, [1, 1, 1, 1], padding='SAME')
-    biases = _variable_on_cpu('biases', [64], tf.constant_initializer(0.0))
-    bias = tf.nn.bias_add(conv, biases)
-    conv1 = tf.nn.relu(bias, name=scope.name)
-    _activation_summary(conv1)
+        x = tf.nn.relu(x)
+        orig_x = x
+      with tf.variable_scope('sub1'):
+        x = conv('conv1', x, 3, in_filter, out_filter, stride)
 
-  # pool1
-  pool1 = tf.nn.max_pool(conv1, ksize=[1, 3, 3, 1], strides=[1, 2, 2, 1],
-                         padding='SAME', name='pool1')
-  # norm1
-  norm1 = tf.nn.lrn(pool1, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,
-                    name='norm1')
-
-  # conv2
-  with tf.variable_scope('conv2') as scope:
-    kernel = _variable_with_weight_decay('weights', shape=[5, 5, 64, 64],
-                                         stddev=1e-4, wd=0.0)
-    conv = tf.nn.conv2d(norm1, kernel, [1, 1, 1, 1], padding='SAME')
-    biases = _variable_on_cpu('biases', [64], tf.constant_initializer(0.1))
-    bias = tf.nn.bias_add(conv, biases)
-    conv2 = tf.nn.relu(bias, name=scope.name)
-    _activation_summary(conv2)
-
-  # norm2
-  norm2 = tf.nn.lrn(conv2, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,
-                    name='norm2')
-  # pool2
-  pool2 = tf.nn.max_pool(norm2, ksize=[1, 3, 3, 1],
-                         strides=[1, 2, 2, 1], padding='SAME', name='pool2')
-
-  # local3
-  with tf.variable_scope('local3') as scope:
-    # Move everything into depth so we can perform a single matrix multiply.
-    reshape = tf.reshape(pool2, [-1, 2304])
-
-    weights = _variable_with_weight_decay('weights', shape=[2304, 384],
-                                          stddev=0.04, wd=0.004)
-    biases = _variable_on_cpu('biases', [384], tf.constant_initializer(0.1))
-    local3 = tf.nn.relu(tf.matmul(reshape, weights) + biases, name=scope.name)
-    _activation_summary(local3)
-
-  # local4
-  with tf.variable_scope('local4') as scope:
-    weights = _variable_with_weight_decay('weights', shape=[384, 192],
-                                          stddev=0.04, wd=0.004)
-    biases = _variable_on_cpu('biases', [192], tf.constant_initializer(0.1))
-    local4 = tf.nn.relu(tf.matmul(local3, weights) + biases, name=scope.name)
-    _activation_summary(local4)
-
-  # softmax, i.e. softmax(WX + b)
-  with tf.variable_scope('softmax_linear') as scope:
-    weights = _variable_with_weight_decay('weights', [192, NUM_CLASSES],
-                                          stddev=1/192.0, wd=0.0)
-    biases = _variable_on_cpu('biases', [NUM_CLASSES],
-                              tf.constant_initializer(0.0))
-    softmax_linear = tf.add(tf.matmul(local4, weights), biases, name=scope.name)
-    _activation_summary(softmax_linear)
-
-  return softmax_linear
+      with tf.variable_scope('sub2'):
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm3')
+        x = tf.nn.relu(x)
+        x = conv('conv2', x, 3, out_filter, out_filter, [1, 1, 1, 1])
   
+      with tf.variable_scope('sub_add'):
+        x += orig_x
+
+    with tf.variable_scope('unit_1_1'):
+      with tf.variable_scope('shared_activation'):
+        orig_x = x
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm1')
+        x = tf.nn.relu(x)
+      with tf.variable_scope('sub1'):
+        x = conv('conv1', x, 3, in_filter, out_filter, stride)
+
+      with tf.variable_scope('sub2'):
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm3')
+        x = tf.nn.relu(x)
+        x = conv('conv2', x, 3, out_filter, out_filter, [1, 1, 1, 1])
+  
+      with tf.variable_scope('sub_add'):
+        x += orig_x
+
+    with tf.variable_scope('unit_1_2'):
+      with tf.variable_scope('shared_activation'):
+        orig_x = x
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm1')
+        x = tf.nn.relu(x)
+      with tf.variable_scope('sub1'):
+        x = conv('conv1', x, 3, in_filter, out_filter, stride)
+
+      with tf.variable_scope('sub2'):
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm3')
+        x = tf.nn.relu(x)
+        x = conv('conv2', x, 3, out_filter, out_filter, [1, 1, 1, 1])
+  
+      with tf.variable_scope('sub_add'):
+        x += orig_x
+
+    with tf.variable_scope('unit_1_3'):
+      with tf.variable_scope('shared_activation'):
+        orig_x = x
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm1')
+        x = tf.nn.relu(x)
+      with tf.variable_scope('sub1'):
+        x = conv('conv1', x, 3, in_filter, out_filter, stride)
+
+      with tf.variable_scope('sub2'):
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm3')
+        x = tf.nn.relu(x)
+        x = conv('conv2', x, 3, out_filter, out_filter, [1, 1, 1, 1])
+  
+      with tf.variable_scope('sub_add'):
+        x += orig_x
+
+    with tf.variable_scope('unit_1_4'):
+      with tf.variable_scope('shared_activation'):
+        orig_x = x
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm1')
+        x = tf.nn.relu(x)
+      with tf.variable_scope('sub1'):
+        x = conv('conv1', x, 3, in_filter, out_filter, stride)
+
+      with tf.variable_scope('sub2'):
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm3')
+        x = tf.nn.relu(x)
+        x = conv('conv2', x, 3, out_filter, out_filter, [1, 1, 1, 1])
+  
+      with tf.variable_scope('sub_add'):
+        x += orig_x
 
 
-"""
-python3 ./Fathom.pyc validate --network-description examples/cifar10_train/model.ckpt-19999.meta --output-validation-type top-5 --output-node softmax_linear/softmax_linear --output-expected-id 8 --image Debug --input-node shuffle_batch
 
-"""
+    in_filter=16
+    out_filter=32
+    stride=[1,2,2,1]
+    with tf.variable_scope('unit_2_0'):
+      with tf.variable_scope('shared_activation'):
+        orig_x = x
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm1')
+        x = tf.nn.relu(x)
+      with tf.variable_scope('sub1'):
+        x = conv('conv1', x, 3, in_filter, out_filter, stride)
 
+      with tf.variable_scope('sub2'):
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm3')
+        x = tf.nn.relu(x)
+        x = conv('conv2', x, 3, out_filter, out_filter, [1, 1, 1, 1])
+
+
+    in_filter=32
+    out_filter=32
+    stride=[1,1,1,1]
+    with tf.variable_scope('unit_2_1'):
+      with tf.variable_scope('shared_activation'):
+        orig_x = x
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm1')
+        x = tf.nn.relu(x)
+      with tf.variable_scope('sub1'):
+        x = conv('conv1', x, 3, in_filter, out_filter, stride)
+
+      with tf.variable_scope('sub2'):
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm3')
+        x = tf.nn.relu(x)
+        x = conv('conv2', x, 3, out_filter, out_filter, [1, 1, 1, 1])
+  
+      with tf.variable_scope('sub_add'):
+        x += orig_x
+
+    with tf.variable_scope('unit_2_2'):
+      with tf.variable_scope('shared_activation'):
+        orig_x = x
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm1')
+        x = tf.nn.relu(x)
+      with tf.variable_scope('sub1'):
+        x = conv('conv1', x, 3, in_filter, out_filter, stride)
+
+      with tf.variable_scope('sub2'):
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm3')
+        x = tf.nn.relu(x)
+        x = conv('conv2', x, 3, out_filter, out_filter, [1, 1, 1, 1])
+  
+      with tf.variable_scope('sub_add'):
+        x += orig_x
+
+    with tf.variable_scope('unit_2_3'):
+      with tf.variable_scope('shared_activation'):
+        orig_x = x
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm1')
+        x = tf.nn.relu(x)
+      with tf.variable_scope('sub1'):
+        x = conv('conv1', x, 3, in_filter, out_filter, stride)
+
+      with tf.variable_scope('sub2'):
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm3')
+        x = tf.nn.relu(x)
+        x = conv('conv2', x, 3, out_filter, out_filter, [1, 1, 1, 1])
+  
+      with tf.variable_scope('sub_add'):
+        x += orig_x
+
+    with tf.variable_scope('unit_2_4'):
+      with tf.variable_scope('shared_activation'):
+        orig_x = x
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm1')
+        x = tf.nn.relu(x)
+      with tf.variable_scope('sub1'):
+        x = conv('conv1', x, 3, in_filter, out_filter, stride)
+
+      with tf.variable_scope('sub2'):
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm3')
+        x = tf.nn.relu(x)
+        x = conv('conv2', x, 3, out_filter, out_filter, [1, 1, 1, 1])
+  
+      with tf.variable_scope('sub_add'):
+        x += orig_x
+
+
+    in_filter=32
+    out_filter=64
+    stride=[1,2,2,1]
+    with tf.variable_scope('unit_3_0'):
+      with tf.variable_scope('sub1'):
+        x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm1')
+        x = tf.nn.relu(x)
+        x = conv('conv1', x, 3, in_filter, out_filter, stride)
+    """
+    with tf.variable_scope('conv2') as scope:
+      kernel = tf.get_variable('weights', [5,5,64,64], initializer=tf.truncated_normal_initializer(stddev=1e-4))
+      x = tf.nn.conv2d(x, kernel, [1, 1, 1, 1], padding='SAME')
+    """
+    with tf.variable_scope('unit_last'):
+      x = tf.nn.lrn(x, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,name='norm_final')
+      x = tf.nn.relu(x)
+      x = tf.nn.avg_pool(x,ksize=[1,6,6,1],strides=[1,1,1,1],padding='VALID',name='avg_pool')
+    
+    with tf.variable_scope('logit'):
+      logits = fully_connected(x,64 ,10)
+      predictions = tf.nn.softmax(logits)    
+
+    return predictions
 
 
 def loss(logits, labels):
